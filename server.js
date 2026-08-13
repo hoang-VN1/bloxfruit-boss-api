@@ -6,63 +6,93 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = "hoang_2026gpt";
 
 const DATA_FILE = path.join(__dirname, "servers.json");
-const DATA_TTL = 5 * 60 * 1000;
+
+// Server không được cập nhật trong 5 phút sẽ bị loại
+const SERVER_TTL = 5 * 60 * 1000;
+
+// Kiểm tra dữ liệu cũ mỗi 30 giây
 const CLEANUP_INTERVAL = 30 * 1000;
 
-function loadServers() {
+function createEmptyData() {
+  return {
+    updatedAt: Date.now(),
+    count: 0,
+    servers: []
+  };
+}
+
+function loadData() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
-      return [];
+      const empty = createEmptyData();
+      saveData(empty);
+      return empty;
     }
 
-    const data = fs.readFileSync(DATA_FILE, "utf8");
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
 
-    if (!data.trim()) {
-      return [];
+    if (!raw.trim()) {
+      return createEmptyData();
     }
 
-    const servers = JSON.parse(data);
+    const data = JSON.parse(raw);
 
-    return Array.isArray(servers) ? servers : [];
+    if (
+      !data ||
+      typeof data !== "object" ||
+      !Array.isArray(data.servers)
+    ) {
+      return createEmptyData();
+    }
+
+    return {
+      updatedAt: Number(data.updatedAt) || Date.now(),
+      count: data.servers.length,
+      servers: data.servers
+    };
   } catch (error) {
-    console.error("Load error:", error.message);
-    return [];
+    console.error("Load servers.json error:", error.message);
+    return createEmptyData();
   }
 }
 
-function saveServers(servers) {
+function saveData(data) {
   try {
+    data.count = data.servers.length;
+    data.updatedAt = Date.now();
+
     fs.writeFileSync(
       DATA_FILE,
-      JSON.stringify(servers, null, 2),
+      JSON.stringify(data, null, 2),
       "utf8"
     );
 
     return true;
   } catch (error) {
-    console.error("Save error:", error.message);
+    console.error("Save servers.json error:", error.message);
     return false;
   }
 }
 
 function cleanupExpired() {
+  const data = loadData();
   const now = Date.now();
-  const servers = loadServers();
 
-  const validServers = servers.filter(server => {
+  const validServers = data.servers.filter(server => {
     const updatedAt = Number(server.updatedAt || 0);
 
     return (
       updatedAt > 0 &&
-      now - updatedAt <= DATA_TTL
+      now - updatedAt <= SERVER_TTL
     );
   });
 
-  if (validServers.length !== servers.length) {
-    saveServers(validServers);
+  if (validServers.length !== data.servers.length) {
+    data.servers = validServers;
+    saveData(data);
   }
 
-  return validServers;
+  return data;
 }
 
 function sendJSON(res, statusCode, data) {
@@ -75,7 +105,7 @@ function sendJSON(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
-function isAuthorized(url, req) {
+function checkAPIKey(req, url) {
   const queryKey = url.searchParams.get("api_key");
   const headerKey = req.headers["x-api-key"];
 
@@ -91,9 +121,7 @@ const server = http.createServer((req, res) => {
     `http://${req.headers.host || "localhost"}`
   );
 
-  if (
-    req.method === "OPTIONS"
-  ) {
+  if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -102,6 +130,10 @@ const server = http.createServer((req, res) => {
 
     return res.end();
   }
+
+  // =========================
+  // API STATUS
+  // =========================
 
   if (
     req.method === "GET" &&
@@ -114,74 +146,47 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  if (
-    req.method === "GET" &&
-    url.pathname === "/api/boss"
-  ) {
-    if (!isAuthorized(url, req)) {
-      return sendJSON(res, 401, {
-        error: "Invalid API key"
-      });
-    }
-
-    const boss = url.searchParams.get("boss");
-
-    if (!boss) {
-      return sendJSON(res, 400, {
-        error: "boss is required"
-      });
-    }
-
-    const servers = cleanupExpired();
-
-    const matches = servers.filter(server => {
-      return (
-        String(server.boss || "").toLowerCase() ===
-        boss.toLowerCase()
-      );
-    });
-
-    return sendJSON(res, 200, {
-      success: true,
-      boss: boss,
-      count: matches.length,
-      updatedAt: Date.now(),
-      expiresAfter: DATA_TTL,
-      servers: matches
-    });
-  }
+  // =========================
+  // GET SERVERS
+  // =========================
 
   if (
     req.method === "GET" &&
     url.pathname === "/api/servers"
   ) {
-    const servers = cleanupExpired();
+    const data = cleanupExpired();
 
-    const boss = url.searchParams.get("boss");
+    let servers = data.servers;
 
-    let result = servers;
+    const maxPlayers = Number(
+      url.searchParams.get("maxPlayers")
+    );
 
-    if (boss) {
-      result = servers.filter(server => {
-        return (
-          String(server.boss || "").toLowerCase() ===
-          boss.toLowerCase()
-        );
+    if (
+      Number.isFinite(maxPlayers) &&
+      maxPlayers > 0
+    ) {
+      servers = servers.filter(server => {
+        return Number(server.maxPlayers || 0) <= maxPlayers;
       });
     }
 
     return sendJSON(res, 200, {
-      success: true,
-      count: result.length,
-      servers: result
+      updatedAt: data.updatedAt,
+      count: servers.length,
+      servers
     });
   }
+
+  // =========================
+  // POST SERVERS
+  // =========================
 
   if (
     req.method === "POST" &&
     url.pathname === "/api/servers"
   ) {
-    if (!isAuthorized(url, req)) {
+    if (!checkAPIKey(req, url)) {
       return sendJSON(res, 401, {
         error: "Invalid API key"
       });
@@ -199,51 +204,43 @@ const server = http.createServer((req, res) => {
 
     req.on("end", () => {
       try {
-        const data = JSON.parse(body);
+        const incoming = JSON.parse(body);
 
-        if (!data.jobId) {
+        if (!Array.isArray(incoming.servers)) {
           return sendJSON(res, 400, {
-            error: "jobId is required"
+            error: "servers must be an array"
           });
         }
 
-        const servers = cleanupExpired();
+        const now = Date.now();
 
-        const entry = {
-          jobId: String(data.jobId),
-          placeId: data.placeId
-            ? String(data.placeId)
-            : null,
-          boss: data.boss
-            ? String(data.boss)
-            : null,
-          players: Number(data.players || 0),
-          maxPlayers: Number(data.maxPlayers || 0),
-          updatedAt: Date.now()
+        const servers = incoming.servers
+          .filter(server => server && server.id)
+          .map(server => {
+            return {
+              id: String(server.id),
+              playing: Number(server.playing || 0),
+              maxPlayers: Number(server.maxPlayers || 0),
+              updatedAt: Number(server.updatedAt) || now
+            };
+          });
+
+        const data = {
+          updatedAt: now,
+          count: servers.length,
+          servers
         };
 
-        const existingIndex = servers.findIndex(
-          server =>
-            server.jobId === entry.jobId
-        );
-
-        if (existingIndex !== -1) {
-          servers[existingIndex] = entry;
-        } else {
-          servers.push(entry);
-        }
-
-        const saved = saveServers(servers);
-
-        if (!saved) {
+        if (!saveData(data)) {
           return sendJSON(res, 500, {
-            error: "Could not save server data"
+            error: "Could not save servers.json"
           });
         }
 
         return sendJSON(res, 200, {
           success: true,
-          server: entry
+          updatedAt: data.updatedAt,
+          count: data.count
         });
       } catch (error) {
         return sendJSON(res, 400, {
@@ -255,46 +252,69 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // =========================
+  // DELETE SERVER
+  // =========================
+
   if (
     req.method === "DELETE" &&
     url.pathname === "/api/servers"
   ) {
-    if (!isAuthorized(url, req)) {
+    if (!checkAPIKey(req, url)) {
       return sendJSON(res, 401, {
         error: "Invalid API key"
       });
     }
 
-    const jobId = url.searchParams.get("jobId");
+    const id = url.searchParams.get("id");
 
-    if (!jobId) {
+    if (!id) {
       return sendJSON(res, 400, {
-        error: "jobId is required"
+        error: "id is required"
       });
     }
 
-    const servers = cleanupExpired();
+    const data = cleanupExpired();
 
-    const filtered = servers.filter(
-      server => server.jobId !== jobId
+    const oldCount = data.servers.length;
+
+    data.servers = data.servers.filter(
+      server => String(server.id) !== String(id)
     );
 
-    saveServers(filtered);
+    saveData(data);
 
     return sendJSON(res, 200, {
       success: true,
-      removed: servers.length - filtered.length
+      removed: oldCount - data.servers.length,
+      count: data.servers.length
     });
   }
+
+  // =========================
+  // NOT FOUND
+  // =========================
 
   return sendJSON(res, 404, {
     error: "Not Found"
   });
 });
 
+// =========================
+// AUTO CLEANUP
+// =========================
+
 setInterval(() => {
-  cleanupExpired();
+  try {
+    cleanupExpired();
+  } catch (error) {
+    console.error("Cleanup error:", error.message);
+  }
 }, CLEANUP_INTERVAL);
+
+// =========================
+// START SERVER
+// =========================
 
 server.listen(PORT, () => {
   console.log(
