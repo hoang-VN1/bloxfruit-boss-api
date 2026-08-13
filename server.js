@@ -7,13 +7,10 @@ const API_KEY = "hoang_2026gpt";
 
 const DATA_FILE = path.join(__dirname, "servers.json");
 
-// Server không được cập nhật trong 5 phút sẽ bị loại
 const SERVER_TTL = 5 * 60 * 1000;
-
-// Kiểm tra dữ liệu cũ mỗi 30 giây
 const CLEANUP_INTERVAL = 30 * 1000;
 
-function createEmptyData() {
+function emptyData() {
   return {
     updatedAt: Date.now(),
     count: 0,
@@ -24,25 +21,19 @@ function createEmptyData() {
 function loadData() {
   try {
     if (!fs.existsSync(DATA_FILE)) {
-      const empty = createEmptyData();
-      saveData(empty);
-      return empty;
+      return emptyData();
     }
 
     const raw = fs.readFileSync(DATA_FILE, "utf8");
 
     if (!raw.trim()) {
-      return createEmptyData();
+      return emptyData();
     }
 
     const data = JSON.parse(raw);
 
-    if (
-      !data ||
-      typeof data !== "object" ||
-      !Array.isArray(data.servers)
-    ) {
-      return createEmptyData();
+    if (!Array.isArray(data.servers)) {
+      return emptyData();
     }
 
     return {
@@ -51,34 +42,27 @@ function loadData() {
       servers: data.servers
     };
   } catch (error) {
-    console.error("Load servers.json error:", error.message);
-    return createEmptyData();
+    console.error("Load error:", error.message);
+    return emptyData();
   }
 }
 
 function saveData(data) {
-  try {
-    data.count = data.servers.length;
-    data.updatedAt = Date.now();
+  data.count = data.servers.length;
+  data.updatedAt = Date.now();
 
-    fs.writeFileSync(
-      DATA_FILE,
-      JSON.stringify(data, null, 2),
-      "utf8"
-    );
-
-    return true;
-  } catch (error) {
-    console.error("Save servers.json error:", error.message);
-    return false;
-  }
+  fs.writeFileSync(
+    DATA_FILE,
+    JSON.stringify(data, null, 2),
+    "utf8"
+  );
 }
 
 function cleanupExpired() {
   const data = loadData();
   const now = Date.now();
 
-  const validServers = data.servers.filter(server => {
+  data.servers = data.servers.filter(server => {
     const updatedAt = Number(server.updatedAt || 0);
 
     return (
@@ -87,16 +71,15 @@ function cleanupExpired() {
     );
   });
 
-  if (validServers.length !== data.servers.length) {
-    data.servers = validServers;
-    saveData(data);
-  }
+  data.count = data.servers.length;
+
+  saveData(data);
 
   return data;
 }
 
-function sendJSON(res, statusCode, data) {
-  res.writeHead(statusCode, {
+function sendJSON(res, status, data) {
+  res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Cache-Control": "no-store"
@@ -105,7 +88,7 @@ function sendJSON(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
-function checkAPIKey(req, url) {
+function checkKey(req, url) {
   const queryKey = url.searchParams.get("api_key");
   const headerKey = req.headers["x-api-key"];
 
@@ -131,10 +114,6 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
-  // =========================
-  // API STATUS
-  // =========================
-
   if (
     req.method === "GET" &&
     url.pathname === "/api/status"
@@ -146,29 +125,21 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  // =========================
-  // GET SERVERS
-  // =========================
-
   if (
     req.method === "GET" &&
     url.pathname === "/api/servers"
   ) {
     const data = cleanupExpired();
 
+    const boss = url.searchParams.get("boss");
+
     let servers = data.servers;
 
-    const maxPlayers = Number(
-      url.searchParams.get("maxPlayers")
-    );
-
-    if (
-      Number.isFinite(maxPlayers) &&
-      maxPlayers > 0
-    ) {
-      servers = servers.filter(server => {
-        return Number(server.maxPlayers || 0) <= maxPlayers;
-      });
+    if (boss) {
+      servers = servers.filter(server =>
+        String(server.boss || "").toLowerCase() ===
+        boss.toLowerCase()
+      );
     }
 
     return sendJSON(res, 200, {
@@ -178,15 +149,44 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  // =========================
-  // POST SERVERS
-  // =========================
+  if (
+    req.method === "GET" &&
+    url.pathname === "/api/boss"
+  ) {
+    if (!checkKey(req, url)) {
+      return sendJSON(res, 401, {
+        error: "Invalid API key"
+      });
+    }
+
+    const boss = url.searchParams.get("boss");
+
+    if (!boss) {
+      return sendJSON(res, 400, {
+        error: "boss is required"
+      });
+    }
+
+    const data = cleanupExpired();
+
+    const servers = data.servers.filter(server =>
+      String(server.boss || "").toLowerCase() ===
+      boss.toLowerCase()
+    );
+
+    return sendJSON(res, 200, {
+      boss,
+      count: servers.length,
+      updatedAt: Date.now(),
+      servers
+    });
+  }
 
   if (
     req.method === "POST" &&
     url.pathname === "/api/servers"
   ) {
-    if (!checkAPIKey(req, url)) {
+    if (!checkKey(req, url)) {
       return sendJSON(res, 401, {
         error: "Invalid API key"
       });
@@ -196,17 +196,13 @@ const server = http.createServer((req, res) => {
 
     req.on("data", chunk => {
       body += chunk;
-
-      if (body.length > 1024 * 1024) {
-        req.destroy();
-      }
     });
 
     req.on("end", () => {
       try {
-        const incoming = JSON.parse(body);
+        const input = JSON.parse(body);
 
-        if (!Array.isArray(incoming.servers)) {
+        if (!Array.isArray(input.servers)) {
           return sendJSON(res, 400, {
             error: "servers must be an array"
           });
@@ -214,16 +210,18 @@ const server = http.createServer((req, res) => {
 
         const now = Date.now();
 
-        const servers = incoming.servers
+        const servers = input.servers
           .filter(server => server && server.id)
-          .map(server => {
-            return {
-              id: String(server.id),
-              playing: Number(server.playing || 0),
-              maxPlayers: Number(server.maxPlayers || 0),
-              updatedAt: Number(server.updatedAt) || now
-            };
-          });
+          .map(server => ({
+            id: String(server.id),
+            playing: Number(server.playing || 0),
+            maxPlayers: Number(server.maxPlayers || 0),
+            boss: server.boss
+              ? String(server.boss)
+              : null,
+            bossFound: Boolean(server.bossFound),
+            updatedAt: now
+          }));
 
         const data = {
           updatedAt: now,
@@ -231,11 +229,7 @@ const server = http.createServer((req, res) => {
           servers
         };
 
-        if (!saveData(data)) {
-          return sendJSON(res, 500, {
-            error: "Could not save servers.json"
-          });
-        }
+        saveData(data);
 
         return sendJSON(res, 200, {
           success: true,
@@ -252,69 +246,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // =========================
-  // DELETE SERVER
-  // =========================
-
-  if (
-    req.method === "DELETE" &&
-    url.pathname === "/api/servers"
-  ) {
-    if (!checkAPIKey(req, url)) {
-      return sendJSON(res, 401, {
-        error: "Invalid API key"
-      });
-    }
-
-    const id = url.searchParams.get("id");
-
-    if (!id) {
-      return sendJSON(res, 400, {
-        error: "id is required"
-      });
-    }
-
-    const data = cleanupExpired();
-
-    const oldCount = data.servers.length;
-
-    data.servers = data.servers.filter(
-      server => String(server.id) !== String(id)
-    );
-
-    saveData(data);
-
-    return sendJSON(res, 200, {
-      success: true,
-      removed: oldCount - data.servers.length,
-      count: data.servers.length
-    });
-  }
-
-  // =========================
-  // NOT FOUND
-  // =========================
-
   return sendJSON(res, 404, {
     error: "Not Found"
   });
 });
 
-// =========================
-// AUTO CLEANUP
-// =========================
-
 setInterval(() => {
-  try {
-    cleanupExpired();
-  } catch (error) {
-    console.error("Cleanup error:", error.message);
-  }
+  cleanupExpired();
 }, CLEANUP_INTERVAL);
-
-// =========================
-// START SERVER
-// =========================
 
 server.listen(PORT, () => {
   console.log(
