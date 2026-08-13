@@ -1,12 +1,13 @@
-           const http = require("http");
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY;
+const API_KEY = "hoang_2026gpt";
 
 const DATA_FILE = path.join(__dirname, "servers.json");
 const DATA_TTL = 5 * 60 * 1000;
+const CLEANUP_INTERVAL = 30 * 1000;
 
 function loadServers() {
   try {
@@ -14,38 +15,59 @@ function loadServers() {
       return [];
     }
 
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch {
+    const data = fs.readFileSync(DATA_FILE, "utf8");
+
+    if (!data.trim()) {
+      return [];
+    }
+
+    const servers = JSON.parse(data);
+
+    return Array.isArray(servers) ? servers : [];
+  } catch (error) {
+    console.error("Load error:", error.message);
     return [];
   }
 }
 
 function saveServers(servers) {
-  fs.writeFileSync(
-    DATA_FILE,
-    JSON.stringify(servers, null, 2)
-  );
+  try {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify(servers, null, 2),
+      "utf8"
+    );
+
+    return true;
+  } catch (error) {
+    console.error("Save error:", error.message);
+    return false;
+  }
 }
 
 function cleanupExpired() {
   const now = Date.now();
-
   const servers = loadServers();
 
-  const valid = servers.filter(server => {
-    return now - Number(server.updatedAt || 0) <= DATA_TTL;
+  const validServers = servers.filter(server => {
+    const updatedAt = Number(server.updatedAt || 0);
+
+    return (
+      updatedAt > 0 &&
+      now - updatedAt <= DATA_TTL
+    );
   });
 
-  if (valid.length !== servers.length) {
-    saveServers(valid);
+  if (validServers.length !== servers.length) {
+    saveServers(validServers);
   }
 
-  return valid;
+  return validServers;
 }
 
-function sendJSON(res, status, data) {
-  res.writeHead(status, {
-    "Content-Type": "application/json",
+function sendJSON(res, statusCode, data) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Cache-Control": "no-store"
   });
@@ -53,21 +75,38 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function checkKey(req, url) {
-  const key =
-    req.headers["x-api-key"] ||
-    url.searchParams.get("api_key");
+function isAuthorized(url, req) {
+  const queryKey = url.searchParams.get("api_key");
+  const headerKey = req.headers["x-api-key"];
 
-  return Boolean(API_KEY && key === API_KEY);
+  return (
+    queryKey === API_KEY ||
+    headerKey === API_KEY
+  );
 }
 
 const server = http.createServer((req, res) => {
   const url = new URL(
     req.url,
-    `http://${req.headers.host}`
+    `http://${req.headers.host || "localhost"}`
   );
 
-  if (req.method === "GET" && url.pathname === "/api/status") {
+  if (
+    req.method === "OPTIONS"
+  ) {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, X-API-Key"
+    });
+
+    return res.end();
+  }
+
+  if (
+    req.method === "GET" &&
+    url.pathname === "/api/status"
+  ) {
     return sendJSON(res, 200, {
       status: "online",
       service: "Boss Server API",
@@ -75,8 +114,11 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  if (req.method === "GET" && url.pathname === "/api/boss") {
-    if (!checkKey(req, url)) {
+  if (
+    req.method === "GET" &&
+    url.pathname === "/api/boss"
+  ) {
+    if (!isAuthorized(url, req)) {
       return sendJSON(res, 401, {
         error: "Invalid API key"
       });
@@ -93,20 +135,53 @@ const server = http.createServer((req, res) => {
     const servers = cleanupExpired();
 
     const matches = servers.filter(server => {
-      return String(server.boss || "").toLowerCase() ===
-        boss.toLowerCase();
+      return (
+        String(server.boss || "").toLowerCase() ===
+        boss.toLowerCase()
+      );
     });
 
     return sendJSON(res, 200, {
-      boss,
+      success: true,
+      boss: boss,
       count: matches.length,
       updatedAt: Date.now(),
+      expiresAfter: DATA_TTL,
       servers: matches
     });
   }
 
-  if (req.method === "POST" && url.pathname === "/api/servers") {
-    if (!checkKey(req, url)) {
+  if (
+    req.method === "GET" &&
+    url.pathname === "/api/servers"
+  ) {
+    const servers = cleanupExpired();
+
+    const boss = url.searchParams.get("boss");
+
+    let result = servers;
+
+    if (boss) {
+      result = servers.filter(server => {
+        return (
+          String(server.boss || "").toLowerCase() ===
+          boss.toLowerCase()
+        );
+      });
+    }
+
+    return sendJSON(res, 200, {
+      success: true,
+      count: result.length,
+      servers: result
+    });
+  }
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/servers"
+  ) {
+    if (!isAuthorized(url, req)) {
       return sendJSON(res, 401, {
         error: "Invalid API key"
       });
@@ -116,6 +191,10 @@ const server = http.createServer((req, res) => {
 
     req.on("data", chunk => {
       body += chunk;
+
+      if (body.length > 1024 * 1024) {
+        req.destroy();
+      }
     });
 
     req.on("end", () => {
@@ -132,30 +211,41 @@ const server = http.createServer((req, res) => {
 
         const entry = {
           jobId: String(data.jobId),
-          placeId: data.placeId || null,
-          boss: data.boss || null,
+          placeId: data.placeId
+            ? String(data.placeId)
+            : null,
+          boss: data.boss
+            ? String(data.boss)
+            : null,
           players: Number(data.players || 0),
           maxPlayers: Number(data.maxPlayers || 0),
           updatedAt: Date.now()
         };
 
-        const index = servers.findIndex(
-          item => item.jobId === entry.jobId
+        const existingIndex = servers.findIndex(
+          server =>
+            server.jobId === entry.jobId
         );
 
-        if (index >= 0) {
-          servers[index] = entry;
+        if (existingIndex !== -1) {
+          servers[existingIndex] = entry;
         } else {
           servers.push(entry);
         }
 
-        saveServers(servers);
+        const saved = saveServers(servers);
+
+        if (!saved) {
+          return sendJSON(res, 500, {
+            error: "Could not save server data"
+          });
+        }
 
         return sendJSON(res, 200, {
           success: true,
           server: entry
         });
-      } catch {
+      } catch (error) {
         return sendJSON(res, 400, {
           error: "Invalid JSON"
         });
@@ -165,21 +255,35 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/api/servers") {
+  if (
+    req.method === "DELETE" &&
+    url.pathname === "/api/servers"
+  ) {
+    if (!isAuthorized(url, req)) {
+      return sendJSON(res, 401, {
+        error: "Invalid API key"
+      });
+    }
+
+    const jobId = url.searchParams.get("jobId");
+
+    if (!jobId) {
+      return sendJSON(res, 400, {
+        error: "jobId is required"
+      });
+    }
+
     const servers = cleanupExpired();
 
-    const boss = url.searchParams.get("boss");
+    const filtered = servers.filter(
+      server => server.jobId !== jobId
+    );
 
-    const filtered = boss
-      ? servers.filter(server =>
-          String(server.boss || "").toLowerCase() ===
-          boss.toLowerCase()
-        )
-      : servers;
+    saveServers(filtered);
 
     return sendJSON(res, 200, {
-      count: filtered.length,
-      servers: filtered
+      success: true,
+      removed: servers.length - filtered.length
     });
   }
 
@@ -190,8 +294,10 @@ const server = http.createServer((req, res) => {
 
 setInterval(() => {
   cleanupExpired();
-}, 30 * 1000);
+}, CLEANUP_INTERVAL);
 
 server.listen(PORT, () => {
-  console.log(`Boss Server API running on port ${PORT}`);
-});                                                                                                           });
+  console.log(
+    `Boss Server API running on port ${PORT}`
+  );
+});
